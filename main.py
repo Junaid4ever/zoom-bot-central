@@ -1,0 +1,154 @@
+# ============================================
+# ZOOM BOT CENTRAL SERVER (Final)
+# ============================================
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+import socketio
+import uvicorn
+from datetime import datetime
+from typing import Dict, List
+import uuid
+
+sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+socket_app = socketio.ASGIApp(sio, app)
+
+workers: Dict[str, dict] = {}
+running_tasks: Dict[str, dict] = {}
+
+class StartBotRequest(BaseModel):
+    meeting_code: str
+    passcode: str = ""
+    bot_count: int
+    duration_minutes: int = 5
+
+@sio.event
+async def connect(sid, environ):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Connected: {sid}")
+
+@sio.event
+async def disconnect(sid):
+    for wid, info in list(workers.items()):
+        if info.get("sid") == sid:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Worker offline: {wid}")
+            del workers[wid]
+            break
+
+@sio.event
+async def register_worker(sid, data):
+    worker_id = data.get("worker_id")
+    max_capacity = data.get("max_capacity", 3)
+    workers[worker_id] = {
+        "sid": sid,
+        "max_capacity": max_capacity,
+        "free_capacity": max_capacity,
+        "last_seen": datetime.now().isoformat()
+    }
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Registered: {worker_id} | Cap: {max_capacity}")
+    await sio.emit("registered", {"status": "ok"}, to=sid)
+
+@sio.event
+async def update_capacity(sid, data):
+    worker_id = data.get("worker_id")
+    free = data.get("free_capacity", 0)
+    if worker_id in workers:
+        workers[worker_id]["free_capacity"] = free
+        workers[worker_id]["last_seen"] = datetime.now().isoformat()
+
+@sio.event
+async def task_completed(sid, data):
+    task_id = data.get("task_id")
+    worker_id = data.get("worker_id")
+    bots_completed = data.get("bots_completed", 0)
+    if task_id in running_tasks:
+        del running_tasks[task_id]
+    if worker_id in workers:
+        workers[worker_id]["free_capacity"] = min(
+            workers[worker_id]["max_capacity"],
+            workers[worker_id]["free_capacity"] + bots_completed
+        )
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Task completed: {task_id}")
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Zoom Bot Central Server",
+        "workers_online": len(workers),
+        "total_free_capacity": sum(w["free_capacity"] for w in workers.values())
+    }
+
+@app.get("/status")
+async def status():
+    return {
+        "workers": workers,
+        "running_tasks": running_tasks,
+        "total_free_capacity": sum(w["free_capacity"] for w in workers.values())
+    }
+
+@app.post("/api/start-bots")
+async def start_bots(req: StartBotRequest):
+    if req.bot_count < 1 or req.bot_count > 300:
+        raise HTTPException(400, "Bot count 1-300 only")
+
+    total_free = sum(w["free_capacity"] for w in workers.values())
+    if total_free < 1:
+        raise HTTPException(503, "No free workers available")
+
+    task_id = str(uuid.uuid4())[:8]
+    remaining = req.bot_count
+    assigned = []
+
+    sorted_workers = sorted(workers.items(), key=lambda x: x[1]["free_capacity"], reverse=True)
+
+    for worker_id, info in sorted_workers:
+        if remaining <= 0:
+            break
+        if info["free_capacity"] <= 0:
+            continue
+
+        take = min(remaining, info["free_capacity"])
+        remaining -= take
+        info["free_capacity"] -= take
+
+        await sio.emit("new_task", {
+            "task_id": task_id,
+            "meeting_code": req.meeting_code,
+            "passcode": req.passcode,
+            "bot_count": take,
+            "duration_minutes": req.duration_minutes
+        }, to=info["sid"])
+
+        assigned.append({"worker": worker_id, "bots": take})
+
+    running_tasks[task_id] = {
+        "meeting_code": req.meeting_code,
+        "bot_count": req.bot_count - remaining,
+        "assigned": assigned,
+        "started_at": datetime.now().isoformat()
+    }
+
+    return {
+        "success": True,
+        "task_id": task_id,
+        "message": f"{req.bot_count - remaining} bots started",
+        "assigned": assigned,
+        "pending": remaining
+    }
+
+@app.post("/api/terminate")
+async def terminate_all():
+    """Saare workers ko terminate signal bhejo"""
+    count = 0
+    for worker_id, info in workers.items():
+        await sio.emit("terminate", {}, to=info["sid"])
+        info["free_capacity"] = info["max_capacity"]
+        count += 1
+
+    running_tasks.clear()
+    return {"success": True, "message": f"Terminate signal sent to {count} workers"}
+
+if __name__ == "__main__":
+    uvicorn.run(socket_app, host="0.0.0.0", port=8000)
