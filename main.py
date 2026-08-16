@@ -15,13 +15,10 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 socket_app = socketio.ASGIApp(sio, app)
 
-# ======================
-# DATA
-# ======================
 workers: Dict[str, dict] = {}
-running_tasks: Dict[str, dict] = {}          # task_id -> info
-active_meetings: Dict[str, dict] = {}        # meeting_code -> info
-kill_history: List[dict] = []                # record of killed meetings
+running_tasks: Dict[str, dict] = {}
+active_meetings: Dict[str, dict] = {}
+kill_history: List[dict] = []
 
 class StartBotRequest(BaseModel):
     meeting_code: str
@@ -34,9 +31,6 @@ class StartBotRequest(BaseModel):
 class KillMeetingRequest(BaseModel):
     meeting_code: str
 
-# ======================
-# SOCKET EVENTS
-# ======================
 @sio.event
 async def connect(sid, environ):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Connected: {sid}")
@@ -90,42 +84,30 @@ async def task_completed(sid, data):
             workers[worker_id]["free_capacity"] + bots_completed
         )
 
-# ======================
-# API
-# ======================
 @app.get("/")
 async def root():
-    return {
-        "message": "Zoom Bot Central Server",
-        "workers_online": len(workers),
-        "total_free_capacity": sum(w["free_capacity"] for w in workers.values())
-    }
+    return {"message": "Zoom Bot Central Server", "workers_online": len(workers)}
 
 @app.get("/status")
 @app.get("/api/status")
 async def status():
     total_capacity = sum(w["max_capacity"] for w in workers.values())
     total_free = sum(w["free_capacity"] for w in workers.values())
-    running_bots = sum(m.get("running_bots", 0) for m in active_meetings.values())
+    running_bots = sum(m.get("running_bots", 0) for m in active_meetings.values() if m.get("status") == "running")
 
     return {
         "workers": workers,
-        "registered_workers": [
-            {"worker_id": wid, "capacity": info["max_capacity"], "free": info["free_capacity"]}
-            for wid, info in workers.items()
-        ],
         "total_capacity": total_capacity,
         "total_free_capacity": total_free,
         "active_meetings": active_meetings,
         "running_bots": running_bots,
-        "running_tasks": running_tasks,
-        "kill_history": kill_history[-20:]   # last 20 records
+        "kill_history": kill_history[-20:]
     }
 
 @app.post("/api/start-bots")
 async def start_bots(req: StartBotRequest):
     if req.bot_count < 1 or req.bot_count > 300:
-        raise HTTPException(400, "Bot count must be 1-300")
+        raise HTTPException(400, "Bot count 1-300 only")
 
     total_free = sum(w["free_capacity"] for w in workers.values())
     if total_free < 1:
@@ -159,53 +141,46 @@ async def start_bots(req: StartBotRequest):
 
         assigned.append({"worker": worker_id, "bots": take})
 
+    started = req.bot_count - remaining
+
     running_tasks[task_id] = {
         "meeting_code": req.meeting_code,
-        "bot_count": req.bot_count - remaining,
+        "bot_count": started,
         "assigned": assigned,
         "started_at": datetime.now().isoformat()
     }
 
-    # Active meeting record
     if req.meeting_code not in active_meetings:
         active_meetings[req.meeting_code] = {
             "meeting_code": req.meeting_code,
-            "total_bots": req.bot_count - remaining,
-            "running_bots": req.bot_count - remaining,
+            "total_bots": started,
+            "running_bots": started,
             "started_at": datetime.now().isoformat(),
             "status": "running",
             "duration_minutes": req.duration_minutes
         }
     else:
-        active_meetings[req.meeting_code]["running_bots"] += (req.bot_count - remaining)
-        active_meetings[req.meeting_code]["total_bots"] += (req.bot_count - remaining)
+        active_meetings[req.meeting_code]["total_bots"] += started
+        active_meetings[req.meeting_code]["running_bots"] += started
         active_meetings[req.meeting_code]["status"] = "running"
 
     return {
         "success": True,
         "task_id": task_id,
-        "message": f"{req.bot_count - remaining} bots started",
-        "total_bots": req.bot_count - remaining,
-        "assigned": assigned,
-        "pending": remaining
+        "message": f"{started} bots started",
+        "total_bots": started,
+        "assigned": assigned
     }
 
 @app.post("/api/kill-meeting")
-@app.post("/api/terminate")
-async def kill_meeting(req: KillMeetingRequest = None):
-    meeting_code = req.meeting_code if req else None
+async def kill_meeting(req: KillMeetingRequest):
+    meeting_code = req.meeting_code
 
-    # Send kill signal to all workers
     for worker_id, info in workers.items():
-        await sio.emit("terminate", {
-            "meeting_code": meeting_code   # None = kill all
-        }, to=info["sid"])
-
-        # Restore capacity
+        await sio.emit("terminate", {"meeting_code": meeting_code}, to=info["sid"])
         info["free_capacity"] = info["max_capacity"]
 
-    # Record
-    if meeting_code and meeting_code in active_meetings:
+    if meeting_code in active_meetings:
         record = {
             "meeting_code": meeting_code,
             "bots": active_meetings[meeting_code].get("total_bots", 0),
@@ -216,15 +191,13 @@ async def kill_meeting(req: KillMeetingRequest = None):
         active_meetings[meeting_code]["status"] = "killed"
         active_meetings[meeting_code]["running_bots"] = 0
 
-    # Clear running tasks of this meeting
     to_delete = [tid for tid, t in running_tasks.items() if t.get("meeting_code") == meeting_code]
     for tid in to_delete:
         del running_tasks[tid]
 
     return {
         "success": True,
-        "message": f"Kill signal sent for meeting {meeting_code}" if meeting_code else "All bots terminated",
-        "record": record if meeting_code else None
+        "message": f"Meeting {meeting_code} killed & capacity restored"
     }
 
 if __name__ == "__main__":
