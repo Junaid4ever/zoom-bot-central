@@ -55,4 +55,151 @@ th{color:#8b949e}
       <div class="fg"><label>Meeting ID</label><input id="meetingId" placeholder="5415403058"/></div>
       <div class="fg"><label>Passcode</label><input id="passcode" placeholder="optional"/></div>
       <div class="fg"><label>Bots</label><input type="number" id="botCount" value="10" min="1" max="500" oninput="updCount()"/></div>
-      <div class="fg"><label>Duration (min)</label><input type="number" id="duration" value="120" min
+      <div class="fg"><label>Duration (min)</label><input type="number" id="duration" value="120" min="1"/></div>
+      <div class="fg">
+        <label>Name Type</label>
+        <select id="nameType" onchange="toggleCustom()">
+          <option value="indian">🇮🇳 Indian (Natural)</option>
+          <option value="english">🇺🇸 English (Faker-style)</option>
+          <option value="custom">✏️ Custom Names</option>
+        </select>
+      </div>
+    </div>
+
+    <div id="customBox">
+      <label style="font-size:12px;color:#8b949e">Custom names (one per line or comma)</label>
+      <textarea id="customNames" rows="4" placeholder="Rahul Sharma&#10;Priya Verma&#10;arjun - 786"></textarea>
+      <div style="font-size:12px;color:#8b949e;margin-top:6px">
+        Names: <strong id="nameCount">0</strong> | Need: <strong id="needCount">10</strong>
+        <span id="nameStatus"></span>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="btn btn-p" onclick="startBots()">🚀 Start Bots</button>
+      <button class="btn btn-d" onclick="killAll()">⏹️ Kill All</button>
+      <button class="btn btn-s" onclick="refresh()">🔄 Refresh</button>
+    </div>
+    <div id="msg" class="log">Ready</div>
+  </div>
+
+  <div class="card">
+    <h2>📋 Active Tasks</h2>
+    <table>
+      <thead><tr><th>Task</th><th>Meeting</th><th>Bots</th><th>Type</th><th>Started</th><th></th></tr></thead>
+      <tbody id="tbody"><tr><td colspan="6" style="text-align:center;color:#8b949e">No tasks</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>🖥️ Workers</h2>
+    <div id="wlist" class="workers"><span style="color:#8b949e">No workers</span></div>
+  </div>
+</div>
+
+<script>
+const API = location.origin;
+
+function toggleCustom(){
+  document.getElementById('customBox').style.display =
+    document.getElementById('nameType').value==='custom'?'block':'none';
+  updCount();
+}
+function updCount(){
+  const bots = parseInt(document.getElementById('botCount').value)||0;
+  const raw = document.getElementById('customNames').value;
+  const names = raw.split(/[\n,]/).map(s=>s.trim()).filter(Boolean);
+  document.getElementById('nameCount').textContent = names.length;
+  document.getElementById('needCount').textContent = bots;
+  const st = document.getElementById('nameStatus');
+  if(document.getElementById('nameType').value!=='custom'){ st.innerHTML=''; return; }
+  st.innerHTML = names.length>=bots
+    ? ' <span class="ok">✅ Enough</span>'
+    : ` <span class="err">❌ Need ${bots-names.length} more</span>`;
+}
+document.getElementById('customNames').addEventListener('input', updCount);
+
+function show(m,t='info'){
+  document.getElementById('msg').innerHTML =
+    `<span class="${t}">[${new Date().toLocaleTimeString()}] ${m}</span>`;
+}
+
+async function refresh(){
+  try{
+    const r = await fetch(API+'/status');
+    const d = await r.json();
+    const workers = d.workers||{};
+    const tasks = d.running_tasks||{};
+    let total=0, free=d.total_free_capacity||0, running=0;
+    Object.values(workers).forEach(w=> total += w.max_capacity||0);
+    Object.values(tasks).forEach(t=> running += t.bot_count||0);
+    document.getElementById('totalCap').textContent = total;
+    document.getElementById('freeCap').textContent = free;
+    document.getElementById('workersN').textContent = Object.keys(workers).length;
+    document.getElementById('tasksN').textContent = Object.keys(tasks).length;
+    document.getElementById('botsN').textContent = running;
+
+    const wl = document.getElementById('wlist');
+    if(!Object.keys(workers).length) wl.innerHTML='<span style="color:#8b949e">No workers — run Colab cell</span>';
+    else wl.innerHTML = Object.entries(workers).map(([id,w])=>
+      `<div class="w">🟢 ${id} → ${w.free_capacity}/${w.max_capacity}</div>`).join('');
+
+    const tb = document.getElementById('tbody');
+    const keys = Object.keys(tasks);
+    if(!keys.length) tb.innerHTML='<tr><td colspan="6" style="text-align:center;color:#8b949e">No tasks</td></tr>';
+    else tb.innerHTML = keys.map(tid=>{
+      const t=tasks[tid];
+      return `<tr>
+        <td>${tid}</td><td><b>${t.meeting_code}</b></td><td>${t.bot_count}</td>
+        <td>${t.name_type||'-'}</td>
+        <td>${t.started_at?new Date(t.started_at).toLocaleTimeString():'-'}</td>
+        <td><button class="btn btn-d btn-sm" onclick="kill('${t.meeting_code}')">Kill</button></td>
+      </tr>`;
+    }).join('');
+    show('Status refreshed','ok');
+  }catch(e){ show(e.message,'err'); }
+}
+
+async function startBots(){
+  const meetingId = document.getElementById('meetingId').value.trim().replace(/\s/g,'');
+  const passcode = document.getElementById('passcode').value.trim();
+  const botCount = parseInt(document.getElementById('botCount').value)||10;
+  const duration = parseInt(document.getElementById('duration').value)||120;
+  const nameType = document.getElementById('nameType').value;
+  let custom = null;
+  if(nameType==='custom'){
+    custom = document.getElementById('customNames').value.split(/[\n,]/).map(s=>s.trim()).filter(Boolean);
+    if(custom.length < botCount) return show(`Need ${botCount-custom.length} more names`,'err');
+  }
+  if(!meetingId) return show('Meeting ID required','err');
+  try{
+    show('Starting...','info');
+    const r = await fetch(API+'/api/start-bots',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        meeting_code: meetingId, passcode, bot_count: botCount,
+        duration_minutes: duration, name_type: nameType, custom_names: custom
+      })
+    });
+    const d = await r.json();
+    if(r.ok){ show(d.message||'Started','ok'); setTimeout(refresh,1500); }
+    else show(d.detail||'Failed','err');
+  }catch(e){ show(e.message,'err'); }
+}
+
+async function kill(code){
+  if(!confirm('Kill '+code+'?')) return;
+  await fetch(API+'/api/terminate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({meeting_code:code})});
+  show('Kill sent','ok'); setTimeout(refresh,1500);
+}
+async function killAll(){
+  if(!confirm('Kill ALL?')) return;
+  await fetch(API+'/api/terminate',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  show('Kill all sent','ok'); setTimeout(refresh,1500);
+}
+
+setInterval(refresh,8000);
+refresh();
+</script>
+</body>
+</html>
